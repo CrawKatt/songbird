@@ -19,6 +19,7 @@ use tokio::process::Command;
 use super::HlsRequest;
 
 const YOUTUBE_DL_COMMAND: &str = "yt-dlp";
+const MAX_RETRIES: u8 = 3;
 
 #[derive(Clone, Debug)]
 enum QueryType {
@@ -106,6 +107,7 @@ impl YoutubeDl {
     }
 
     async fn query(&mut self, n_results: usize) -> Result<Vec<Output>, AudioStreamError> {
+        let mut retries = 0;
         let new_query;
         let query_str = match &self.query {
             QueryType::Url(url) => url,
@@ -120,49 +122,61 @@ impl YoutubeDl {
             "-f",
             "ba[abr>0][vcodec=none]/best",
             "--no-playlist",
+            "--proxy",
+            "socks5://127.0.0.1:9050",
         ];
 
-        let mut output = Command::new(self.program)
-            .args(ytdl_args)
-            .output()
-            .await
-            .map_err(|e| {
-                AudioStreamError::Fail(if e.kind() == ErrorKind::NotFound {
-                    format!("could not find executable '{}' on path", self.program).into()
-                } else {
-                    Box::new(e)
-                })
-            })?;
+        loop {
+            let mut output = Command::new(self.program)
+                .args(ytdl_args)
+                .output()
+                .await
+                .map_err(|e| {
+                    AudioStreamError::Fail(if e.kind() == ErrorKind::NotFound {
+                        format!("could not find executable '{}' on path", self.program).into()
+                    } else {
+                        Box::new(e)
+                    })
+                })?;
 
-        if !output.status.success() {
-            return Err(AudioStreamError::Fail(
-                format!(
-                    "{} failed with non-zero status code: {}",
-                    self.program,
-                    std::str::from_utf8(&output.stderr[..]).unwrap_or("<no error message>")
-                )
-                .into(),
-            ));
+            if output.status.success() {
+                // NOTE: must be split_mut for simd-json.
+                let out = output
+                    .stdout
+                    .split_mut(|&b| b == b'\n')
+                    .filter_map(|x| (!x.is_empty()).then(|| crate::json::from_slice(x)))
+                    .collect::<Result<Vec<Output>, _>>()
+                    .map_err(|e| AudioStreamError::Fail(Box::new(e)))?;
+
+                let meta = out.first()
+                    .ok_or_else(|| { AudioStreamError::Fail(format!("no results found for '{query_str}'").into()) })?
+                    .as_aux_metadata();
+
+                self.metadata = Some(meta);
+
+                return Ok(out);
+            } else {
+                retries += 1;
+                if retries > MAX_RETRIES {
+                    return Err(AudioStreamError::Fail(
+                        format!("{} failed after {} retries with error: {}", self.program, MAX_RETRIES,
+                                std::str::from_utf8(&output.stderr).unwrap_or("<no error message>")).into(),
+                    ));
+                }
+            }
+
+            if let Err(why) = Command::new("sudo")
+                .arg("systemctl")
+                .arg("restart")
+                .arg("tor")
+                .spawn()
+                .expect("failed to restart tor")
+                .wait()
+                .await
+            {
+                return Err(AudioStreamError::Fail(format!("failed to restart tor: {}", why).into()));
+            }
         }
-
-        // NOTE: must be split_mut for simd-json.
-        let out = output
-            .stdout
-            .split_mut(|&b| b == b'\n')
-            .filter_map(|x| (!x.is_empty()).then(|| crate::json::from_slice(x)))
-            .collect::<Result<Vec<Output>, _>>()
-            .map_err(|e| AudioStreamError::Fail(Box::new(e)))?;
-
-        let meta = out
-            .first()
-            .ok_or_else(|| {
-                AudioStreamError::Fail(format!("no results found for '{query_str}'").into())
-            })?
-            .as_aux_metadata();
-
-        self.metadata = Some(meta);
-
-        Ok(out)
     }
 }
 
